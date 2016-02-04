@@ -6,18 +6,19 @@ from std_msgs.msg import String
 import time
 import random
 from meccanoid_movements import MeccanoidMovements
+import sys
 
 
 class Movements():
-    pub = None
-    sub = None
+    pub_to_robot = None
+    sub_from_robot = None
+    sub_kinect = None
     log = None
-    robot_platform = "to_meccanoid"
+    to_robot_platform = "to_meccanoid"
+    from_robot_platform = "from_meccanoid"
     kinect_topic = "tracking"
 
     traj = []               # the trajectories
-    base_pos = []
-    base_traj = []
     episode_length = 60     # duration, in seconds, of each episode
 
     # managing the kinect-driven start
@@ -25,67 +26,102 @@ class Movements():
     kinect_state = None     # state, either calibrating or tracking
 
 
-    def __init__(self):
-        rospy.init_node('movements')
-        self.pub = rospy.Publisher(self.robot_platform, String, queue_size=10)
-        self.log = rospy.Publisher("movement_log", String, queue_size=10)
-        self.sub = rospy.Subscriber(self.kinect_topic, String, self.analyze_kinect)
-        time.sleep(1)
-        mm = MeccanoidMovements()
-        self.traj = mm.the_traj
-        self.base_pos = mm.the_base_pos
-        self.base_traj = mm.the_base_traj
+    state_stage = "pre start"   # pre start --> start --> episode
+    state_start = "init"        # init --> base position
+    state_traj = -1             # counter of positions in trajectory
+    state_episode = None        # trajectory
+    t0 = None                   # measure time inside an episode
 
+    def __init__(self, morphology="humanoid"):
+        rospy.init_node('movements')
+        self.pub_to_robot = rospy.Publisher(self.to_robot_platform, String, queue_size=10)
+        self.sub_from_robot = rospy.Subscriber(self.from_robot_platform, String, self.get_response)
+
+        self.sub_kinect = rospy.Subscriber(self.kinect_topic, String, self.analyze_kinect)
+
+        self.log = rospy.Publisher("movement_log", String, queue_size=10)
+
+
+        time.sleep(1)
+        mm = MeccanoidMovements(morphology)
+        self.traj = mm.the_traj
+
+        self.state_stage = "pre start"
+        self.publish("init")
         rospy.spin()
 
     def publish(self, data):
-        self.pub.publish(data)
-        time.sleep(1.5)
+        time.sleep(0.3)
+        self.pub_to_robot.publish(data)
 
     def analyze_kinect(self, data):
         current_state = data.data
         if current_state == "tracking" and Movements.kinect_state == "calibrating":
-            print("kinect")
-            self.start_episode()
+            self.state_stage = "start"
+            self.state_start = "base position"
+            self.move_on()
         Movements.kinect_state = current_state
 
-    def start_episode(self):
-        self.log_experiment("start episode")
-        Movements.is_running += 1
-        self.log_experiment("base position")
-        self.run_traj(self.base_pos)
-        self.run()
+    def get_response(self, data):
+        print(data.data)
+        if "finished" in data.data:
+            self.move_on()
 
-    def run(self):
-        # set to initial position
-        self.log_experiment("base trajectory")
-        self.run_traj(self.base_traj)
+    def send_traj(self, traj_name, pos_i = 0):
+        self.publish(self.traj[traj_name][pos_i]["pos"])
 
-        self.log_experiment("base position")
-        self.run_traj(self.base_pos)
+    def move_on(self):
+        self.log_experiment(self.state_stage)
+        if self.state_stage == "start":
+            self.log_experiment(self.state_start)
+            if self.state_start == "init":
+                self.publish("init")
+                self.state_start = "base position"
+                return
+            if self.state_start == "base position":
+                self.send_traj("base_pos")
+                self.state_start = "start episode"
+                return
+            if self.state_start == "start episode":
+                self.state_start = "base position"
+                self.state_stage = "episode"
+                self.state_traj = 0
+                self.t0 = time.time()
+                self.run_algo()
+                return
+        if self.state_stage == "episode":
+            self.log_experiment(self.state_episode)
+            if self.state_episode == None:
+                #returned to base position
+                self.state_traj = 0
+                self.run_algo()
+                return
+            if self.state_traj < len(self.traj[self.state_episode]):
+                # still in the loop of trajectory
+                self.send_traj(self.state_episode,self.state_traj)
+                self.state_traj += 1
+                return
+            if self.state_traj >= len(self.traj[self.state_episode]):
+                # finished trajectory loop
+                self.state_traj = 0
+                self.run_algo()
+                return
 
-        if len(self.traj) > 0:
-            k = 0
-            t0 = time.time()
-            dt = time.time() - t0
-            while dt < self.episode_length and Movements.is_running == 1:
-                # generate a random motion
+    def run_algo(self):
+        if self.state_episode == None:
+            if (time.time() - self.t0) < self.episode_length:
                 num = random.randint(1, len(self.traj.keys())) - 1
-
-                self.log_experiment(self.traj.keys()[num])
-                self.run_traj(self.traj[self.traj.keys()[num]])
-
-                self.log_experiment("base position")
-                self.run_traj(self.base_pos)
-                dt = time.time() - t0
-
-                k+=1
-            Movements.is_running -= 1
-        self.end_episode()
-
-    def end_episode(self):
-        self.log_experiment("end episode")
-        kinect_state = None
+                self.state_episode = self.traj.keys()[num]
+                self.move_on()
+                return
+            else:
+                self.log_experiment("end episode")
+                self.state_stage = "start"
+                return
+        else: # return to base position
+            self.state_episode = None
+            self.send_traj("base_pos")
+            return
 
     def log_experiment(self, comment):
         print(comment)
@@ -94,16 +130,19 @@ class Movements():
     def run_traj(self, t):
         # t - trajectory
         for m in t:
-            if Movements.is_running == 1:
-                if 'pos' in m:
-                    self.publish(m['pos'])
-                if 'delay' in m:
-                    time.sleep(m['delay'])
+            if 'pos' in m:
+                self.publish(m['pos'])
+            if 'delay' in m:
+                time.sleep(m['delay'])
+        time.sleep(0.5)
 
 if __name__ == '__main__':
     try:
-        m = Movements()
-#        m.start_episode()
+        morphology = "humanoid"
+        if len(sys.argv) > 1:
+            morphology = sys.argv[1]
+        print("Running morphology: ", morphology)
+        m = Movements(morphology)
 
     except rospy.ROSInterruptException:
         pass
